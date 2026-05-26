@@ -1,5 +1,6 @@
 # Prerequisites
 *.d
+.DS_Store
 
 # Compiled Object files
 *.slo
@@ -44,3 +45,7 @@ build/
 __pycache__/
 _asdl/
 _code/
+
+# Local notes / drafts
+proposal.tex
+scratch.py
