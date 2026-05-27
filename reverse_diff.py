@@ -100,18 +100,19 @@ def reverse_diff(diff_func_id : str,
             case _:
                 assert False
 
-    def accum_deriv(target, deriv, overwrite):
+    def accum_deriv(target, deriv, overwrite, use_atomic=False):
         match target.t:
             case loma_ir.Int():
                 return []
             case loma_ir.Float():
                 if overwrite:
                     return [loma_ir.Assign(target, deriv)]
-                else:
-                    #return [loma_ir.Assign(target,
-                    #    loma_ir.BinaryOp(loma_ir.Add(), target, deriv))]
+                elif use_atomic:
                     return [loma_ir.CallStmt(loma_ir.Call('atomic_add',
                         [target, deriv]))]
+                else:
+                    return [loma_ir.Assign(target,
+                        loma_ir.BinaryOp(loma_ir.Add(), target, deriv))]
             case loma_ir.Struct():
                 s = target.t
                 stmts = []
@@ -121,11 +122,11 @@ def reverse_diff(diff_func_id : str,
                     deriv_m = loma_ir.StructAccess(
                         deriv, m.id, t = m.t)
                     if isinstance(m.t, loma_ir.Float):
-                        stmts += accum_deriv(target_m, deriv_m, overwrite)
+                        stmts += accum_deriv(target_m, deriv_m, overwrite, use_atomic)
                     elif isinstance(m.t, loma_ir.Int):
                         pass
                     elif isinstance(m.t, loma_ir.Struct):
-                        stmts += accum_deriv(target_m, deriv_m, overwrite)
+                        stmts += accum_deriv(target_m, deriv_m, overwrite, use_atomic)
                     else:
                         assert isinstance(m.t, loma_ir.Array)
                         assert m.t.static_size is not None
@@ -134,7 +135,7 @@ def reverse_diff(diff_func_id : str,
                                 target_m, loma_ir.ConstInt(i), t = m.t.t)
                             deriv_m = loma_ir.ArrayAccess(
                                 deriv_m, loma_ir.ConstInt(i), t = m.t.t)
-                            stmts += accum_deriv(target_m, deriv_m, overwrite)
+                            stmts += accum_deriv(target_m, deriv_m, overwrite, use_atomic)
                 return stmts
             case _:
                 assert False
@@ -251,8 +252,9 @@ def reverse_diff(diff_func_id : str,
             return loma_ir.Call(node.id, new_args, t = node.t)
 
     class ForwardPassMutator(irmutator.IRMutator):
-        def __init__(self, output_args):
+        def __init__(self, output_args, cache_required):
             self.output_args = output_args
+            self.cache_required = cache_required
             self.cache_vars_list = {}
             self.var_to_dvar = {}
             self.type_cache_size = {}
@@ -290,6 +292,8 @@ def reverse_diff(diff_func_id : str,
                 node.target,
                 self.mutate_expr(node.val),
                 lineno = node.lineno)
+            if node not in self.cache_required:
+                return [assign_primal]
             # backup
             t_str = type_to_string(node.val.t)
             if t_str in self.type_to_stack_and_ptr_names:
@@ -334,6 +338,8 @@ def reverse_diff(diff_func_id : str,
                         loma_ir.Arg('source', loma_ir.Float(), loma_ir.In())]
             for i, f_arg in enumerate(args):
                 if f_arg.i == loma_ir.Out():
+                    if (node, i) not in self.cache_required:
+                        continue
                     arg_expr = call_expr.args[i]
                     t_str = type_to_string(f_arg.t)
                     if t_str in self.type_to_stack_and_ptr_names:
@@ -425,10 +431,220 @@ def reverse_diff(diff_func_id : str,
 
     # HW2 happens here. Modify the following IR mutators to perform
     # reverse differentiation.
+    def base_var(expr):
+        match expr:
+            case loma_ir.Var():
+                return expr.id
+            case loma_ir.ArrayAccess():
+                return base_var(expr.array)
+            case loma_ir.StructAccess():
+                return base_var(expr.struct)
+            case _:
+                return None
+
+    def vars_in_lvalue_address(expr):
+        match expr:
+            case loma_ir.Var():
+                return set()
+            case loma_ir.ArrayAccess():
+                return vars_in_lvalue_address(expr.array) | vars_read_by_value(expr.index)
+            case loma_ir.StructAccess():
+                return vars_in_lvalue_address(expr.struct)
+            case _:
+                return set()
+
+    def vars_read_by_value(expr):
+        match expr:
+            case loma_ir.Var():
+                return {expr.id}
+            case loma_ir.ArrayAccess():
+                base = base_var(expr)
+                reads = {base} if base is not None else set()
+                return reads | vars_in_lvalue_address(expr)
+            case loma_ir.StructAccess():
+                base = base_var(expr)
+                return {base} if base is not None else set()
+            case loma_ir.ConstFloat() | loma_ir.ConstInt():
+                return set()
+            case loma_ir.BinaryOp():
+                return vars_read_by_value(expr.left) | vars_read_by_value(expr.right)
+            case loma_ir.Call():
+                reads = set()
+                for arg in expr.args:
+                    reads |= vars_read_by_value(arg)
+                return reads
+            case _:
+                return set()
+
+    def vars_read_by_reverse_expr(expr):
+        match expr:
+            case loma_ir.Var():
+                return set()
+            case loma_ir.ArrayAccess() | loma_ir.StructAccess():
+                return vars_in_lvalue_address(expr)
+            case loma_ir.ConstFloat() | loma_ir.ConstInt():
+                return set()
+            case loma_ir.BinaryOp():
+                match expr.op:
+                    case loma_ir.Add() | loma_ir.Sub():
+                        return vars_read_by_reverse_expr(expr.left) | vars_read_by_reverse_expr(expr.right)
+                    case loma_ir.Mul() | loma_ir.Div():
+                        return vars_read_by_value(expr.left) | vars_read_by_value(expr.right)
+                    case _:
+                        return vars_read_by_value(expr.left) | vars_read_by_value(expr.right)
+            case loma_ir.Call():
+                match expr.id:
+                    case 'int2float' | 'float2int':
+                        return set()
+                    case 'make__dfloat':
+                        reads = set()
+                        for arg in expr.args:
+                            reads |= vars_read_by_reverse_expr(arg)
+                        return reads
+                    case 'atomic_add':
+                        return vars_in_lvalue_address(expr.args[0]) | vars_read_by_reverse_expr(expr.args[1])
+                    case _:
+                        reads = set()
+                        for arg in expr.args:
+                            reads |= vars_read_by_value(arg)
+                        return reads
+            case _:
+                return set()
+
+    class ReversePrimalLiveness:
+        """Marks forward writes whose old primal value is needed by reverse AD."""
+        def __init__(self, output_args):
+            self.output_args = output_args
+            self.cache_required = set()
+
+        def analyze_stmt_list(self, stmts, live_after):
+            live = set(live_after)
+            for stmt in reversed(stmts):
+                live = self.analyze_stmt(stmt, live)
+            return live
+
+        def analyze_stmt(self, stmt, live_after):
+            match stmt:
+                case loma_ir.Assign():
+                    if check_lhs_is_output_arg(stmt.target, self.output_args):
+                        return live_after
+                    target = base_var(stmt.target)
+                    reads = vars_read_by_reverse_expr(stmt.val) | vars_in_lvalue_address(stmt.target)
+                    live_before = reads | (live_after - ({target} if target is not None else set()))
+                    if target is not None and target in live_before:
+                        self.cache_required.add(stmt)
+                    return live_before
+                case loma_ir.Declare():
+                    if stmt.val is None:
+                        return live_after
+                    reads = vars_read_by_reverse_expr(stmt.val)
+                    return reads | (live_after - {stmt.target})
+                case loma_ir.Return():
+                    return vars_read_by_reverse_expr(stmt.val) | live_after
+                case loma_ir.IfElse():
+                    then_live = self.analyze_stmt_list(stmt.then_stmts, set(live_after))
+                    else_live = self.analyze_stmt_list(stmt.else_stmts, set(live_after))
+                    return vars_read_by_value(stmt.cond) | then_live | else_live
+                case loma_ir.While():
+                    live = set(live_after)
+                    while True:
+                        before = self.analyze_stmt_list(stmt.body, live)
+                        before |= vars_read_by_value(stmt.cond)
+                        new_live = live_after | before
+                        if new_live == live:
+                            return before
+                        live = new_live
+                case loma_ir.CallStmt():
+                    if stmt.call.id != 'atomic_add':
+                        args = funcs[stmt.call.id].args
+                    else:
+                        args = [loma_ir.Arg('target', loma_ir.Float(), loma_ir.Out()),
+                                loma_ir.Arg('source', loma_ir.Float(), loma_ir.In())]
+                    reverse_reads = set()
+                    live_before = set(live_after)
+                    for i, f_arg in enumerate(args):
+                        arg_expr = stmt.call.args[i]
+                        if f_arg.i == loma_ir.In():
+                            reverse_reads |= vars_read_by_value(arg_expr)
+                        else:
+                            target = base_var(arg_expr)
+                            reverse_reads |= vars_in_lvalue_address(arg_expr)
+                            live_before -= ({target} if target is not None else set())
+                    live_before |= reverse_reads
+                    for i, f_arg in enumerate(args):
+                        if f_arg.i == loma_ir.Out():
+                            target = base_var(stmt.call.args[i])
+                            if target is not None and target in live_before and \
+                                    not check_lhs_is_output_arg(stmt.call.args[i], self.output_args):
+                                self.cache_required.add((stmt, i))
+                    return live_before
+                case _:
+                    return live_after
+
+        def mark_stmt_list_forward(self, stmts, live_prefix):
+            live = set(live_prefix)
+            for stmt in stmts:
+                live = self.mark_stmt_forward(stmt, live)
+            return live
+
+        def mark_stmt_forward(self, stmt, live_prefix):
+            match stmt:
+                case loma_ir.Assign():
+                    if check_lhs_is_output_arg(stmt.target, self.output_args):
+                        return live_prefix
+                    target = base_var(stmt.target)
+                    reads = vars_read_by_reverse_expr(stmt.val) | vars_in_lvalue_address(stmt.target)
+                    if target is not None and target in (live_prefix | reads):
+                        self.cache_required.add(stmt)
+                    return live_prefix | reads
+                case loma_ir.Declare():
+                    if stmt.val is None:
+                        return live_prefix
+                    return live_prefix | vars_read_by_reverse_expr(stmt.val)
+                case loma_ir.Return():
+                    return live_prefix | vars_read_by_reverse_expr(stmt.val)
+                case loma_ir.IfElse():
+                    cond_reads = vars_read_by_value(stmt.cond)
+                    then_live = self.mark_stmt_list_forward(stmt.then_stmts, live_prefix | cond_reads)
+                    else_live = self.mark_stmt_list_forward(stmt.else_stmts, live_prefix | cond_reads)
+                    return live_prefix | cond_reads | then_live | else_live
+                case loma_ir.While():
+                    live = set(live_prefix) | vars_read_by_value(stmt.cond)
+                    while True:
+                        new_live = self.mark_stmt_list_forward(stmt.body, live)
+                        new_live |= vars_read_by_value(stmt.cond)
+                        if new_live == live:
+                            return live
+                        live = new_live
+                case loma_ir.CallStmt():
+                    if stmt.call.id != 'atomic_add':
+                        args = funcs[stmt.call.id].args
+                    else:
+                        args = [loma_ir.Arg('target', loma_ir.Float(), loma_ir.Out()),
+                                loma_ir.Arg('source', loma_ir.Float(), loma_ir.In())]
+                    reads = set()
+                    for i, f_arg in enumerate(args):
+                        arg_expr = stmt.call.args[i]
+                        if f_arg.i == loma_ir.In():
+                            reads |= vars_read_by_value(arg_expr)
+                        else:
+                            reads |= vars_in_lvalue_address(arg_expr)
+                    for i, f_arg in enumerate(args):
+                        if f_arg.i == loma_ir.Out():
+                            arg_expr = stmt.call.args[i]
+                            target = base_var(arg_expr)
+                            if target is not None and target in (live_prefix | reads) and \
+                                    not check_lhs_is_output_arg(arg_expr, self.output_args):
+                                self.cache_required.add((stmt, i))
+                    return live_prefix | reads
+                case _:
+                    return live_prefix
+
     class RevDiffMutator(irmutator.IRMutator):
         def mutate_function_def(self, node):
             cnm = CallNormalizeMutator()
             node = cnm.mutate_function(node)
+            self.use_atomic_add = node.is_simd
 
             random.seed(hash(node.id))
             # Each input argument is followed by an output (the adjoint)
@@ -452,8 +668,13 @@ def reverse_diff(diff_func_id : str,
                 self.return_var_id = '_dreturn_' + random_id_generator()
                 new_args.append(loma_ir.Arg(self.return_var_id, node.ret_type, i = loma_ir.In()))
 
+            liveness = ReversePrimalLiveness(self.output_args)
+            liveness.analyze_stmt_list(node.body, set())
+            liveness.mark_stmt_list_forward(node.body, set())
+            self.cache_required = liveness.cache_required
+
             # Forward pass
-            fm = ForwardPassMutator(self.output_args)
+            fm = ForwardPassMutator(self.output_args, liveness.cache_required)
             forward_body = node.body
             mutated_forward = [fm.mutate_stmt(fwd_stmt) for fwd_stmt in forward_body]
             mutated_forward = irmutator.flatten(mutated_forward)
@@ -510,6 +731,8 @@ def reverse_diff(diff_func_id : str,
 
         def mutate_assign(self, node):
             if node.val.t == loma_ir.Int():
+                if node not in self.cache_required:
+                    return []
                 stmts = []
                 # restore the previous value of this assignment
                 t_str = type_to_string(node.val.t)
@@ -529,13 +752,14 @@ def reverse_diff(diff_func_id : str,
             else:
                 stmts = []
                 # restore the previous value of this assignment
-                t_str = type_to_string(node.val.t)
-                _, stack_ptr_name = self.type_to_stack_and_ptr_names[t_str]
-                stack_ptr_var = loma_ir.Var(stack_ptr_name, t=loma_ir.Int())
-                stmts.append(loma_ir.Assign(stack_ptr_var,
-                    loma_ir.BinaryOp(loma_ir.Sub(), stack_ptr_var, loma_ir.ConstInt(1))))
-                cache_var_expr, cache_target = self.cache_vars_list[node.val.t].pop()
-                stmts.append(loma_ir.Assign(cache_target, cache_var_expr))
+                if node in self.cache_required:
+                    t_str = type_to_string(node.val.t)
+                    _, stack_ptr_name = self.type_to_stack_and_ptr_names[t_str]
+                    stack_ptr_var = loma_ir.Var(stack_ptr_name, t=loma_ir.Int())
+                    stmts.append(loma_ir.Assign(stack_ptr_var,
+                        loma_ir.BinaryOp(loma_ir.Sub(), stack_ptr_var, loma_ir.ConstInt(1))))
+                    cache_var_expr, cache_target = self.cache_vars_list[node.val.t].pop()
+                    stmts.append(loma_ir.Assign(cache_target, cache_var_expr))
                 
                 # First pass: accumulate
                 self.in_assign = True
@@ -576,8 +800,11 @@ def reverse_diff(diff_func_id : str,
                         needs_restore = True
             if needs_restore:
                 # restore the previous values of the output variables
-                for f_arg in reversed(args):
+                for i in reversed(range(len(args))):
+                    f_arg = args[i]
                     if f_arg.i == loma_ir.Out():
+                        if (node, i) not in self.cache_required:
+                            continue
                         t_str = type_to_string(f_arg.t)
                         _, stack_ptr_name = self.type_to_stack_and_ptr_names[t_str]
                         stack_ptr_var = loma_ir.Var(stack_ptr_name, t=loma_ir.Int())
@@ -631,11 +858,11 @@ def reverse_diff(diff_func_id : str,
                 target_expr = loma_ir.Var(target, t=node.t)
                 self.adj_accum_stmts += \
                     accum_deriv(var_to_differential(node, self.var_to_dvar),
-                        target_expr, overwrite = False)
-                return [accum_deriv(target_expr, self.adj, overwrite = True)]
+                        target_expr, overwrite = False, use_atomic = self.use_atomic_add)
+                return [accum_deriv(target_expr, self.adj, overwrite = True, use_atomic = self.use_atomic_add)]
             else:
                 return [accum_deriv(var_to_differential(node, self.var_to_dvar),
-                    self.adj, overwrite = False)]
+                    self.adj, overwrite = False, use_atomic = self.use_atomic_add)]
 
         def mutate_const_float(self, node):
             return []
@@ -651,11 +878,11 @@ def reverse_diff(diff_func_id : str,
                 target_expr = loma_ir.Var(target, t=node.t)
                 self.adj_accum_stmts += \
                     accum_deriv(var_to_differential(node, self.var_to_dvar),
-                        target_expr, overwrite = False)
-                return [accum_deriv(target_expr, self.adj, overwrite = True)]
+                        target_expr, overwrite = False, use_atomic = self.use_atomic_add)
+                return [accum_deriv(target_expr, self.adj, overwrite = True, use_atomic = self.use_atomic_add)]
             else:
                 return [accum_deriv(var_to_differential(node, self.var_to_dvar),
-                    self.adj, overwrite = False)]
+                    self.adj, overwrite = False, use_atomic = self.use_atomic_add)]
 
         def mutate_struct_access(self, node):
             if self.in_assign:
@@ -665,11 +892,11 @@ def reverse_diff(diff_func_id : str,
                 target_expr = loma_ir.Var(target, t=node.t)
                 self.adj_accum_stmts += \
                     accum_deriv(var_to_differential(node, self.var_to_dvar),
-                        target_expr, overwrite = False)
-                return [accum_deriv(target_expr, self.adj, overwrite = True)]
+                        target_expr, overwrite = False, use_atomic = self.use_atomic_add)
+                return [accum_deriv(target_expr, self.adj, overwrite = True, use_atomic = self.use_atomic_add)]
             else:
                 return [accum_deriv(var_to_differential(node, self.var_to_dvar),
-                    self.adj, overwrite = False)]
+                    self.adj, overwrite = False, use_atomic = self.use_atomic_add)]
 
         def mutate_add(self, node):
             left = self.mutate_expr(node.left)
@@ -865,7 +1092,7 @@ def reverse_diff(diff_func_id : str,
                         node.args[1], self.var_to_dvar)
                     source = var_to_differential(\
                         node.args[0], self.var_to_dvar)
-                    return accum_deriv(target, source, overwrite = False)
+                    return accum_deriv(target, source, overwrite = False, use_atomic = self.use_atomic_add)
                 case 'make__dfloat':
                     # z = make__dfloat(x, y)
                     old_adj = self.adj
