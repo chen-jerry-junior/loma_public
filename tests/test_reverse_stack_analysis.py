@@ -92,6 +92,8 @@ def float_stack_slots(c_code):
 
 
 def stack_slots_by_type(c_code):
+    # Reverse-mode primal stacks are emitted as fixed-size C arrays. Counting
+    # those declarations gives a stable compiler metric for the report.
     slots_by_type = {"float": 0, "int": 0}
     for c_type, size in re.findall(r"\b(float|int) _t_(?:float|int)_[A-Za-z0-9]+\[(\d+)\];", c_code):
         slots_by_type[c_type] += int(size)
@@ -113,6 +115,8 @@ class StackBenchmark:
     source: str
     conservative_float_slots_per_iter: int
     notes: str
+    # loop_depth controls the expected conservative growth: one loop is O(N),
+    # two equally bounded nested loops are O(N^2), and so on.
     loop_depth: int = 1
 
 
@@ -146,6 +150,8 @@ STACK_BENCHMARKS = [
 
 
 def source_with_max_iter(source, max_iter):
+    # The stack arrays are sized from max_iter, so the report varies the static
+    # loop bound rather than the runtime n/m values.
     return re.sub(r"max_iter\s*:=\s*\d+", f"max_iter := {max_iter}", source)
 
 
@@ -155,6 +161,8 @@ def stack_report_rows(max_iters):
         for max_iter in max_iters:
             code = differentiated_c_code(source_with_max_iter(bench.source, max_iter))
             after_slots = stack_slots_by_type(code)
+            # "Before" models the old conservative policy: every overwritten
+            # float inside the loop body is pushed once per possible iteration.
             before_float_slots = bench.conservative_float_slots_per_iter * (max_iter ** bench.loop_depth)
             before_bytes = total_stack_bytes(before_float_slots, after_slots["int"])
             after_bytes = total_stack_bytes(after_slots["float"], after_slots["int"])
@@ -180,6 +188,8 @@ def percent_reduction(before, after):
 
 
 def write_result_report(output_path="result.md"):
+    # Keep the report generation attached to the regression test so the numbers
+    # stay in sync with the compiler implementation.
     rows = stack_report_rows(range(1, 11))
     summary_rows = [row for row in rows if row["max_iter"] == 10]
 

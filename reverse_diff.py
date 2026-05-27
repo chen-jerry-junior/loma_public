@@ -5,7 +5,6 @@ import irmutator
 import autodiff
 import string
 import random
-import pretty_print
 
 # From https://stackoverflow.com/questions/2257441/random-string-generation-with-upper-case-letters-and-digits
 def random_id_generator(size=6, chars=string.ascii_lowercase + string.ascii_uppercase + string.digits):
@@ -108,9 +107,13 @@ def reverse_diff(diff_func_id : str,
                 if overwrite:
                     return [loma_ir.Assign(target, deriv)]
                 elif use_atomic:
+                    # SIMD reverse kernels may have multiple lanes accumulating
+                    # into the same adjoint, so those updates must be atomic.
                     return [loma_ir.CallStmt(loma_ir.Call('atomic_add',
                         [target, deriv]))]
                 else:
+                    # Scalar C reverse code is single-threaded, so a plain add is
+                    # simpler and avoids unnecessary atomic builtins.
                     return [loma_ir.Assign(target,
                         loma_ir.BinaryOp(loma_ir.Add(), target, deriv))]
             case loma_ir.Struct():
@@ -254,6 +257,8 @@ def reverse_diff(diff_func_id : str,
     class ForwardPassMutator(irmutator.IRMutator):
         def __init__(self, output_args, cache_required):
             self.output_args = output_args
+            # Set by ReversePrimalLiveness. Writes outside this set can be
+            # handled in reverse mode without restoring their old primal value.
             self.cache_required = cache_required
             self.cache_vars_list = {}
             self.var_to_dvar = {}
@@ -284,10 +289,8 @@ def reverse_diff(diff_func_id : str,
             if check_lhs_is_output_arg(node.target, self.output_args):
                 return []
 
-            # y = f(x0, x1, ..., y)
-            # we will use a temporary array _t to hold variable y for later use:
-            # _t[stack_pos++] = y
-            # y = f(x0, x1, ..., y)
+            # y = f(x0, x1, ..., y). Only save the old y if the reverse pass
+            # needs that primal value, e.g. for nonlinear derivatives like cos(y).
             assign_primal = loma_ir.Assign(\
                 node.target,
                 self.mutate_expr(node.val),
@@ -329,7 +332,8 @@ def reverse_diff(diff_func_id : str,
                 if check_lhs_is_output_arg(arg_expr, self.output_args):
                     return []
 
-            # similar to assign: backup all outputs of the function
+            # Similar to assignment: backup only the out-arguments whose old
+            # primal values are needed by the reverse call.
             stmts = []
             if call_expr.id != 'atomic_add':
                 args = funcs[call_expr.id].args
@@ -432,6 +436,8 @@ def reverse_diff(diff_func_id : str,
     # HW2 happens here. Modify the following IR mutators to perform
     # reverse differentiation.
     def base_var(expr):
+        # Collapse x, x[i], and x.foo to the owning variable name. The analysis
+        # works at variable granularity, which is conservative for arrays/structs.
         match expr:
             case loma_ir.Var():
                 return expr.id
@@ -443,6 +449,8 @@ def reverse_diff(diff_func_id : str,
                 return None
 
     def vars_in_lvalue_address(expr):
+        # Reads needed to locate an l-value, such as the index in a[i]. The
+        # storage being written is not counted as a read here.
         match expr:
             case loma_ir.Var():
                 return set()
@@ -454,6 +462,7 @@ def reverse_diff(diff_func_id : str,
                 return set()
 
     def vars_read_by_value(expr):
+        # Ordinary forward reads of primal values.
         match expr:
             case loma_ir.Var():
                 return {expr.id}
@@ -477,6 +486,8 @@ def reverse_diff(diff_func_id : str,
                 return set()
 
     def vars_read_by_reverse_expr(expr):
+        # Primal reads needed by the local reverse rule. Add/sub do not need
+        # operand primal values, while mul/div and nonlinear calls do.
         match expr:
             case loma_ir.Var():
                 return set()
@@ -518,6 +529,8 @@ def reverse_diff(diff_func_id : str,
             self.cache_required = set()
 
         def analyze_stmt_list(self, stmts, live_after):
+            # Backward pass: mark writes whose overwritten value is needed by a
+            # later reverse statement.
             live = set(live_after)
             for stmt in reversed(stmts):
                 live = self.analyze_stmt(stmt, live)
@@ -582,6 +595,9 @@ def reverse_diff(diff_func_id : str,
                     return live_after
 
         def mark_stmt_list_forward(self, stmts, live_prefix):
+            # Forward pass: catches same-iteration dependencies such as
+            # z = z + x followed by sin(z), where this write becomes a needed
+            # primal for a later statement.
             live = set(live_prefix)
             for stmt in stmts:
                 live = self.mark_stmt_forward(stmt, live)
@@ -673,7 +689,8 @@ def reverse_diff(diff_func_id : str,
             liveness.mark_stmt_list_forward(node.body, set())
             self.cache_required = liveness.cache_required
 
-            # Forward pass
+            # Forward pass: emit the original primal computation and insert stack
+            # saves only for writes selected by the dependency analysis above.
             fm = ForwardPassMutator(self.output_args, liveness.cache_required)
             forward_body = node.body
             mutated_forward = [fm.mutate_stmt(fwd_stmt) for fwd_stmt in forward_body]
@@ -751,7 +768,8 @@ def reverse_diff(diff_func_id : str,
                 return self.mutate_expr(node.val)
             else:
                 stmts = []
-                # restore the previous value of this assignment
+                # Restore the previous value only when the forward pass actually
+                # saved it; linear updates can skip this stack traffic.
                 if node in self.cache_required:
                     t_str = type_to_string(node.val.t)
                     _, stack_ptr_name = self.type_to_stack_and_ptr_names[t_str]
@@ -799,7 +817,7 @@ def reverse_diff(diff_func_id : str,
                     if not check_lhs_is_output_arg(call_expr.args[i], self.output_args):
                         needs_restore = True
             if needs_restore:
-                # restore the previous values of the output variables
+                # Restore only call outputs selected by the dependency analysis.
                 for i in reversed(range(len(args))):
                     f_arg = args[i]
                     if f_arg.i == loma_ir.Out():
