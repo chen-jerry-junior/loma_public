@@ -13,6 +13,8 @@ Peak bytes include both float primal stacks and unchanged integer loop-index sta
 | nonlinear_recurrence | 10 | 10 | 10 | 0.0% | 80 | 80 | 0.0% | sin(z) needs the old z value. |
 | linear_then_sin | 20 | 10 | 10 | 50.0% | 120 | 80 | 33.3% | z = z + x is linear, but the later sin(z) needs z. |
 | nested_linear_accumulation | 100 | 0 | 120 | 100.0% | 880 | 480 | 45.5% | Nested linear recurrence; old z values scale with max_iter squared before analysis. |
+| constant_scale_recurrence | 10 | 0 | 10 | 100.0% | 80 | 40 | 50.0% | Constant scaling is affine, so old z values are not needed. |
+| array_indexed_accumulation | 10 | 0 | 10 | 100.0% | 80 | 40 | 50.0% | Float primal values are unnecessary; integer indices are still restored. |
 
 ## Stack Growth vs Static Loop Bound
 
@@ -58,6 +60,26 @@ Peak bytes include both float primal stacks and unchanged integer loop-index sta
 | nested_linear_accumulation | 8 | 64 | 0 | 80 | 576 | 320 |
 | nested_linear_accumulation | 9 | 81 | 0 | 99 | 720 | 396 |
 | nested_linear_accumulation | 10 | 100 | 0 | 120 | 880 | 480 |
+| constant_scale_recurrence | 1 | 1 | 0 | 1 | 8 | 4 |
+| constant_scale_recurrence | 2 | 2 | 0 | 2 | 16 | 8 |
+| constant_scale_recurrence | 3 | 3 | 0 | 3 | 24 | 12 |
+| constant_scale_recurrence | 4 | 4 | 0 | 4 | 32 | 16 |
+| constant_scale_recurrence | 5 | 5 | 0 | 5 | 40 | 20 |
+| constant_scale_recurrence | 6 | 6 | 0 | 6 | 48 | 24 |
+| constant_scale_recurrence | 7 | 7 | 0 | 7 | 56 | 28 |
+| constant_scale_recurrence | 8 | 8 | 0 | 8 | 64 | 32 |
+| constant_scale_recurrence | 9 | 9 | 0 | 9 | 72 | 36 |
+| constant_scale_recurrence | 10 | 10 | 0 | 10 | 80 | 40 |
+| array_indexed_accumulation | 1 | 1 | 0 | 1 | 8 | 4 |
+| array_indexed_accumulation | 2 | 2 | 0 | 2 | 16 | 8 |
+| array_indexed_accumulation | 3 | 3 | 0 | 3 | 24 | 12 |
+| array_indexed_accumulation | 4 | 4 | 0 | 4 | 32 | 16 |
+| array_indexed_accumulation | 5 | 5 | 0 | 5 | 40 | 20 |
+| array_indexed_accumulation | 6 | 6 | 0 | 6 | 48 | 24 |
+| array_indexed_accumulation | 7 | 7 | 0 | 7 | 56 | 28 |
+| array_indexed_accumulation | 8 | 8 | 0 | 8 | 64 | 32 |
+| array_indexed_accumulation | 9 | 9 | 0 | 9 | 72 | 36 |
+| array_indexed_accumulation | 10 | 10 | 0 | 10 | 80 | 40 |
 
 ## Correctness Checks
 
@@ -67,3 +89,5 @@ Peak bytes include both float primal stacks and unchanged integer loop-index sta
 | nonlinear_recurrence | product of `cos(z_i)` terms |
 | linear_then_sin | `d/dx sin(n*x) = n*cos(n*x)` |
 | nested_linear_accumulation | `d/dx sum_i sum_j x = n*m` |
+| constant_scale_recurrence | affine recurrence derivative `d' = 2*d + 1` |
+| array_indexed_accumulation | `d/dx[i] sum_i x[i]*x[i] = 2*x[i]` |

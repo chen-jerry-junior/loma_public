@@ -77,6 +77,43 @@ rev_nested_linear_accum = rev_diff(nested_linear_accum)
 """
 
 
+CONSTANT_SCALE_RECURRENCE = """
+def constant_scale_recurrence(x : In[float], n : In[int]) -> float:
+    i : int = 0
+    z : float = x
+    while (i < n, max_iter := 10):
+        z = 2.0 * z + x
+        i = i + 1
+    return z
+
+rev_constant_scale_recurrence = rev_diff(constant_scale_recurrence)
+"""
+
+
+OVERWRITE_AFTER_NONLINEAR_USE = """
+def overwrite_after_nonlinear_use(x : In[float]) -> float:
+    z : float = x
+    y : float = sin(z)
+    z = z + 1.0
+    return y
+
+rev_overwrite_after_nonlinear_use = rev_diff(overwrite_after_nonlinear_use)
+"""
+
+
+ARRAY_INDEXED_ACCUM = """
+def array_indexed_accum(x : In[Array[float]], n : In[int]) -> float:
+    i : int = 0
+    s : float = 0.0
+    while (i < n, max_iter := 10):
+        s = s + x[i] * x[i]
+        i = i + 1
+    return s
+
+rev_array_indexed_accum = rev_diff(array_indexed_accum)
+"""
+
+
 def differentiated_c_code(source):
     with contextlib.redirect_stdout(io.StringIO()):
         structs, funcs = parser.parse(source)
@@ -145,6 +182,18 @@ STACK_BENCHMARKS = [
         conservative_float_slots_per_iter=1,
         notes="Nested linear recurrence; old z values scale with max_iter squared before analysis.",
         loop_depth=2,
+    ),
+    StackBenchmark(
+        "constant_scale_recurrence",
+        CONSTANT_SCALE_RECURRENCE,
+        conservative_float_slots_per_iter=1,
+        notes="Constant scaling is affine, so old z values are not needed.",
+    ),
+    StackBenchmark(
+        "array_indexed_accumulation",
+        ARRAY_INDEXED_ACCUM,
+        conservative_float_slots_per_iter=1,
+        notes="Float primal values are unnecessary; integer indices are still restored.",
     ),
 ]
 
@@ -241,6 +290,8 @@ def write_result_report(output_path="result.md"):
         "| nonlinear_recurrence | product of `cos(z_i)` terms |",
         "| linear_then_sin | `d/dx sin(n*x) = n*cos(n*x)` |",
         "| nested_linear_accumulation | `d/dx sum_i sum_j x = n*m` |",
+        "| constant_scale_recurrence | affine recurrence derivative `d' = 2*d + 1` |",
+        "| array_indexed_accumulation | `d/dx[i] sum_i x[i]*x[i] = 2*x[i]` |",
         "",
     ]
 
@@ -332,6 +383,55 @@ class ReverseStackAnalysisTest(unittest.TestCase):
             1.0,
         )
         self.assertAlmostEqual(dx.value, n * m, places=5)
+
+    def test_constant_scale_recurrence_eliminates_float_stack(self):
+        code = differentiated_c_code(CONSTANT_SCALE_RECURRENCE)
+
+        conservative_stack_slots_before_analysis = 10
+        self.assertEqual(float_stack_slots(code), 0)
+        self.assertLess(float_stack_slots(code), conservative_stack_slots_before_analysis)
+
+        _, lib = compile_quiet(CONSTANT_SCALE_RECURRENCE, "_code/rev_stack_constant_scale")
+        dx = ctypes.c_float(0.0)
+        dn = ctypes.c_int(0)
+        x = 0.6
+        n = 5
+        lib.rev_constant_scale_recurrence(x, ctypes.byref(dx), n, ctypes.byref(dn), 1.0)
+
+        expected = 1.0
+        for _ in range(n):
+            expected = 2.0 * expected + 1.0
+        self.assertAlmostEqual(dx.value, expected, places=5)
+
+    def test_overwrite_after_nonlinear_use_keeps_one_restore(self):
+        code = differentiated_c_code(OVERWRITE_AFTER_NONLINEAR_USE)
+
+        self.assertEqual(float_stack_slots(code), 1)
+
+        _, lib = compile_quiet(OVERWRITE_AFTER_NONLINEAR_USE, "_code/rev_stack_overwrite_after_use")
+        dx = ctypes.c_float(0.0)
+        x = 0.7
+        lib.rev_overwrite_after_nonlinear_use(x, ctypes.byref(dx), 1.0)
+        self.assertAlmostEqual(dx.value, math.cos(x), places=5)
+
+    def test_array_indexed_accumulation_restores_indices_not_floats(self):
+        code = differentiated_c_code(ARRAY_INDEXED_ACCUM)
+        slots = stack_slots_by_type(code)
+
+        self.assertEqual(slots["float"], 0)
+        self.assertEqual(slots["int"], 10)
+
+        _, lib = compile_quiet(ARRAY_INDEXED_ACCUM, "_code/rev_stack_array_indexed_accum")
+        x_values = [1.0, 2.0, 3.0, 4.0]
+        x = (ctypes.c_float * len(x_values))(*x_values)
+        dx = (ctypes.c_float * len(x_values))(*([0.0] * len(x_values)))
+        dn = ctypes.c_int(0)
+        n = 3
+        lib.rev_array_indexed_accum(x, dx, n, ctypes.byref(dn), 1.0)
+
+        expected = [2.0, 4.0, 6.0, 0.0]
+        for actual, expected_value in zip(dx, expected):
+            self.assertAlmostEqual(actual, expected_value, places=5)
 
 
 if __name__ == "__main__":

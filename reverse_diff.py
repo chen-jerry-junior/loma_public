@@ -485,9 +485,31 @@ def reverse_diff(diff_func_id : str,
             case _:
                 return set()
 
+    def expr_can_receive_adjoint(expr):
+        # Constants and casts from integers do not produce reverse statements.
+        # This lets affine forms such as 2.0 * z avoid treating z as a needed
+        # primal value: the generated adjoint only uses the constant scale.
+        match expr:
+            case loma_ir.Var() | loma_ir.ArrayAccess() | loma_ir.StructAccess():
+                return not isinstance(expr.t, loma_ir.Int)
+            case loma_ir.ConstFloat() | loma_ir.ConstInt():
+                return False
+            case loma_ir.BinaryOp():
+                return expr_can_receive_adjoint(expr.left) or expr_can_receive_adjoint(expr.right)
+            case loma_ir.Call():
+                match expr.id:
+                    case 'int2float' | 'float2int':
+                        return False
+                    case _:
+                        return any(expr_can_receive_adjoint(arg) for arg in expr.args)
+            case _:
+                return False
+
     def vars_read_by_reverse_expr(expr):
         # Primal reads needed by the local reverse rule. Add/sub do not need
-        # operand primal values, while mul/div and nonlinear calls do.
+        # operand primal values. Mul/div only need the opposite operand values
+        # for operands that actually receive adjoints, so constant scaling stays
+        # linear and stack-free.
         match expr:
             case loma_ir.Var():
                 return set()
@@ -499,8 +521,21 @@ def reverse_diff(diff_func_id : str,
                 match expr.op:
                     case loma_ir.Add() | loma_ir.Sub():
                         return vars_read_by_reverse_expr(expr.left) | vars_read_by_reverse_expr(expr.right)
-                    case loma_ir.Mul() | loma_ir.Div():
-                        return vars_read_by_value(expr.left) | vars_read_by_value(expr.right)
+                    case loma_ir.Mul():
+                        reads = set()
+                        if expr_can_receive_adjoint(expr.left):
+                            reads |= vars_read_by_value(expr.right)
+                        if expr_can_receive_adjoint(expr.right):
+                            reads |= vars_read_by_value(expr.left)
+                        return reads
+                    case loma_ir.Div():
+                        reads = set()
+                        if expr_can_receive_adjoint(expr.left):
+                            reads |= vars_read_by_value(expr.right)
+                        if expr_can_receive_adjoint(expr.right):
+                            reads |= vars_read_by_value(expr.left)
+                            reads |= vars_read_by_value(expr.right)
+                        return reads
                     case _:
                         return vars_read_by_value(expr.left) | vars_read_by_value(expr.right)
             case loma_ir.Call():
