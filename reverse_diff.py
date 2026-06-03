@@ -436,8 +436,6 @@ def reverse_diff(diff_func_id : str,
     # HW2 happens here. Modify the following IR mutators to perform
     # reverse differentiation.
     def base_var(expr):
-        # Collapse x, x[i], and x.foo to the owning variable name. The analysis
-        # works at variable granularity, which is conservative for arrays/structs.
         match expr:
             case loma_ir.Var():
                 return expr.id
@@ -447,6 +445,94 @@ def reverse_diff(diff_func_id : str,
                 return base_var(expr.struct)
             case _:
                 return None
+
+    def expr_key(expr):
+        """Hashable expression key for comparing array index syntax."""
+        match expr:
+            case loma_ir.Var():
+                return ('var', expr.id)
+            case loma_ir.ConstInt():
+                return ('int', expr.val)
+            case loma_ir.ConstFloat():
+                return ('float', expr.val)
+            case loma_ir.BinaryOp():
+                return (type(expr.op).__name__,
+                        expr_key(expr.left),
+                        expr_key(expr.right))
+            case loma_ir.ArrayAccess():
+                return ('array', expr_key(expr.array), expr_key(expr.index))
+            case loma_ir.StructAccess():
+                return ('struct', expr_key(expr.struct), expr.member_id)
+            case loma_ir.Call():
+                return ('call', expr.id, tuple(expr_key(arg) for arg in expr.args))
+            case _:
+                return ('unknown',)
+
+    def location(expr):
+        """A symbolic memory location used by reverse primal liveness."""
+        match expr:
+            case loma_ir.Var():
+                return ('var', expr.id)
+            case loma_ir.ArrayAccess():
+                parent = location(expr.array)
+                return None if parent is None else ('array', parent, expr_key(expr.index))
+            case loma_ir.StructAccess():
+                parent = location(expr.struct)
+                return None if parent is None else ('struct', parent, expr.member_id)
+            case _:
+                return None
+
+    def index_keys_may_alias(left, right):
+        # Constant indices are the only disjoint case we can prove locally.
+        if left[0] == 'int' and right[0] == 'int':
+            return left[1] == right[1]
+        return True
+
+    def loc_may_alias(left, right):
+        if left is None or right is None:
+            return True
+        if left == right:
+            return True
+        if left[0] == 'var' and right[0] == 'var':
+            return left[1] == right[1]
+        if left[0] == 'array' and right[0] == 'array':
+            return loc_may_alias(left[1], right[1]) and index_keys_may_alias(left[2], right[2])
+        if left[0] == 'struct' and right[0] == 'struct':
+            return left[2] == right[2] and loc_may_alias(left[1], right[1])
+        if left[0] == 'array':
+            return loc_may_alias(left[1], right)
+        if right[0] == 'array':
+            return loc_may_alias(left, right[1])
+        if left[0] == 'struct':
+            return loc_may_alias(left[1], right)
+        if right[0] == 'struct':
+            return loc_may_alias(left, right[1])
+        return False
+
+    def loc_is_prefix(prefix, loc):
+        if prefix is None or loc is None:
+            return False
+        if prefix == loc:
+            return True
+        match loc:
+            case ('array', parent, _):
+                return loc_is_prefix(prefix, parent)
+            case ('struct', parent, _):
+                return loc_is_prefix(prefix, parent)
+            case _:
+                return False
+
+    def remove_overwritten_locs(live, target):
+        if target is None:
+            return set(live)
+        return {loc for loc in live if not loc_is_prefix(target, loc)}
+
+    def any_may_alias(target, locs):
+        return target is not None and any(loc_may_alias(target, loc) for loc in locs)
+
+    def location_set(expr):
+        loc = location(expr)
+        return set() if loc is None else {loc}
 
     def vars_in_lvalue_address(expr):
         # Reads needed to locate an l-value, such as the index in a[i]. The
@@ -465,14 +551,11 @@ def reverse_diff(diff_func_id : str,
         # Ordinary forward reads of primal values.
         match expr:
             case loma_ir.Var():
-                return {expr.id}
+                return location_set(expr)
             case loma_ir.ArrayAccess():
-                base = base_var(expr)
-                reads = {base} if base is not None else set()
-                return reads | vars_in_lvalue_address(expr)
+                return location_set(expr) | vars_in_lvalue_address(expr)
             case loma_ir.StructAccess():
-                base = base_var(expr)
-                return {base} if base is not None else set()
+                return location_set(expr)
             case loma_ir.ConstFloat() | loma_ir.ConstInt():
                 return set()
             case loma_ir.BinaryOp():
@@ -576,17 +659,17 @@ def reverse_diff(diff_func_id : str,
                 case loma_ir.Assign():
                     if check_lhs_is_output_arg(stmt.target, self.output_args):
                         return live_after
-                    target = base_var(stmt.target)
+                    target = location(stmt.target)
                     reads = vars_read_by_reverse_expr(stmt.val) | vars_in_lvalue_address(stmt.target)
-                    live_before = reads | (live_after - ({target} if target is not None else set()))
-                    if target is not None and target in live_before:
+                    live_before = reads | remove_overwritten_locs(live_after, target)
+                    if any_may_alias(target, live_before):
                         self.cache_required.add(stmt)
                     return live_before
                 case loma_ir.Declare():
                     if stmt.val is None:
                         return live_after
                     reads = vars_read_by_reverse_expr(stmt.val)
-                    return reads | (live_after - {stmt.target})
+                    return reads | remove_overwritten_locs(live_after, ('var', stmt.target))
                 case loma_ir.Return():
                     return vars_read_by_reverse_expr(stmt.val) | live_after
                 case loma_ir.IfElse():
@@ -615,14 +698,14 @@ def reverse_diff(diff_func_id : str,
                         if f_arg.i == loma_ir.In():
                             reverse_reads |= vars_read_by_value(arg_expr)
                         else:
-                            target = base_var(arg_expr)
+                            target = location(arg_expr)
                             reverse_reads |= vars_in_lvalue_address(arg_expr)
-                            live_before -= ({target} if target is not None else set())
+                            live_before = remove_overwritten_locs(live_before, target)
                     live_before |= reverse_reads
                     for i, f_arg in enumerate(args):
                         if f_arg.i == loma_ir.Out():
-                            target = base_var(stmt.call.args[i])
-                            if target is not None and target in live_before and \
+                            target = location(stmt.call.args[i])
+                            if any_may_alias(target, live_before) and \
                                     not check_lhs_is_output_arg(stmt.call.args[i], self.output_args):
                                 self.cache_required.add((stmt, i))
                     return live_before
@@ -643,9 +726,9 @@ def reverse_diff(diff_func_id : str,
                 case loma_ir.Assign():
                     if check_lhs_is_output_arg(stmt.target, self.output_args):
                         return live_prefix
-                    target = base_var(stmt.target)
+                    target = location(stmt.target)
                     reads = vars_read_by_reverse_expr(stmt.val) | vars_in_lvalue_address(stmt.target)
-                    if target is not None and target in (live_prefix | reads):
+                    if any_may_alias(target, live_prefix | reads):
                         self.cache_required.add(stmt)
                     return live_prefix | reads
                 case loma_ir.Declare():
@@ -683,8 +766,8 @@ def reverse_diff(diff_func_id : str,
                     for i, f_arg in enumerate(args):
                         if f_arg.i == loma_ir.Out():
                             arg_expr = stmt.call.args[i]
-                            target = base_var(arg_expr)
-                            if target is not None and target in (live_prefix | reads) and \
+                            target = location(arg_expr)
+                            if any_may_alias(target, live_prefix | reads) and \
                                     not check_lhs_is_output_arg(arg_expr, self.output_args):
                                 self.cache_required.add((stmt, i))
                     return live_prefix | reads

@@ -17,6 +17,9 @@ import check
 import codegen_c
 import compiler
 import parser
+import slang_utils
+import slangpy
+import numpy as np
 
 
 LINEAR_ACCUM = """
@@ -90,6 +93,19 @@ rev_constant_scale_recurrence = rev_diff(constant_scale_recurrence)
 """
 
 
+NONCONSTANT_SCALE_RECURRENCE = """
+def nonconstant_scale_recurrence(x : In[float], n : In[int]) -> float:
+    i : int = 0
+    z : float = 1.0
+    while (i < n, max_iter := 10):
+        z = x * z + 1.0
+        i = i + 1
+    return z
+
+rev_nonconstant_scale_recurrence = rev_diff(nonconstant_scale_recurrence)
+"""
+
+
 OVERWRITE_AFTER_NONLINEAR_USE = """
 def overwrite_after_nonlinear_use(x : In[float]) -> float:
     z : float = x
@@ -111,6 +127,88 @@ def array_indexed_accum(x : In[Array[float]], n : In[int]) -> float:
     return s
 
 rev_array_indexed_accum = rev_diff(array_indexed_accum)
+"""
+
+
+ARRAY_CONSTANT_INDEX_SEPARATION = """
+def array_constant_index_separation(x : In[float]) -> float:
+    a : Array[float, 2]
+    a[0] = x
+    a[1] = x + 1.0
+    y : float = sin(a[0])
+    a[1] = a[1] + 2.0
+    return y
+
+rev_array_constant_index_separation = rev_diff(array_constant_index_separation)
+"""
+
+
+ARRAY_SAME_CONSTANT_INDEX_ALIAS = """
+def array_same_constant_index_alias(x : In[float]) -> float:
+    a : Array[float, 2]
+    a[0] = x
+    y : float = sin(a[0])
+    a[0] = a[0] + 2.0
+    return y
+
+rev_array_same_constant_index_alias = rev_diff(array_same_constant_index_alias)
+"""
+
+
+ARRAY_DYNAMIC_INDEX_MAY_ALIAS = """
+def array_dynamic_index_may_alias(x : In[float], i : In[int], j : In[int]) -> float:
+    a : Array[float, 2]
+    a[i] = x
+    y : float = sin(a[j])
+    a[i] = a[i] + 2.0
+    return y
+
+rev_array_dynamic_index_may_alias = rev_diff(array_dynamic_index_may_alias)
+"""
+
+
+BRANCH_LINEAR_OR_NONLINEAR = """
+def branch_linear_or_nonlinear(x : In[float], flag : In[int]) -> float:
+    z : float = x
+    if flag > 0:
+        z = z + 1.0
+    else:
+        z = z * z
+    return z
+
+rev_branch_linear_or_nonlinear = rev_diff(branch_linear_or_nonlinear)
+"""
+
+
+SIMD_LINEAR_ACCUM = """
+@simd
+def simd_linear_accum(x : In[Array[float]], n : In[int], y : Out[Array[float]]):
+    tid : int = thread_id()
+    i : int = 0
+    z : float = 0.0
+    while (i < n, max_iter := 10):
+        z = z + x[tid]
+        i = i + 1
+    y[tid] = z
+
+rev_simd_linear_accum = rev_diff(simd_linear_accum)
+"""
+
+
+SIMD_LINEAR_THEN_SIN = """
+@simd
+def simd_linear_then_sin(x : In[Array[float]], n : In[int], y : Out[Array[float]]):
+    tid : int = thread_id()
+    i : int = 0
+    z : float = 0.0
+    out : float = 0.0
+    while (i < n, max_iter := 10):
+        z = z + x[tid]
+        out = sin(z)
+        i = i + 1
+    y[tid] = out
+
+rev_simd_linear_then_sin = rev_diff(simd_linear_then_sin)
 """
 
 
@@ -146,6 +244,17 @@ def compile_quiet(source, output_filename):
         return compiler.compile(source, target="c", output_filename=output_filename)
 
 
+def compile_slang_quiet(source):
+    slang_device = slang_utils.create_slang_device()
+    with contextlib.redirect_stdout(io.StringIO()):
+        module, kernels = compiler.compile(
+            source,
+            target="slang",
+            slang_device=slang_device,
+        )
+    return slang_device, module, kernels
+
+
 @dataclass(frozen=True)
 class StackBenchmark:
     name: str
@@ -155,6 +264,7 @@ class StackBenchmark:
     # loop_depth controls the expected conservative growth: one loop is O(N),
     # two equally bounded nested loops are O(N^2), and so on.
     loop_depth: int = 1
+    has_loop_bound: bool = True
 
 
 STACK_BENCHMARKS = [
@@ -190,10 +300,32 @@ STACK_BENCHMARKS = [
         notes="Constant scaling is affine, so old z values are not needed.",
     ),
     StackBenchmark(
+        "nonconstant_scale_recurrence",
+        NONCONSTANT_SCALE_RECURRENCE,
+        conservative_float_slots_per_iter=1,
+        notes="x receives an adjoint, so z = x*z + 1 needs old z values.",
+    ),
+    StackBenchmark(
         "array_indexed_accumulation",
         ARRAY_INDEXED_ACCUM,
         conservative_float_slots_per_iter=1,
         notes="Float primal values are unnecessary; integer indices are still restored.",
+    ),
+    StackBenchmark(
+        "array_constant_index_separation",
+        ARRAY_CONSTANT_INDEX_SEPARATION,
+        conservative_float_slots_per_iter=1,
+        notes="Disjoint constant indices avoid the old base-array false alias.",
+        loop_depth=0,
+        has_loop_bound=False,
+    ),
+    StackBenchmark(
+        "branch_linear_or_nonlinear",
+        BRANCH_LINEAR_OR_NONLINEAR,
+        conservative_float_slots_per_iter=2,
+        notes="The linear branch is stack-free, but the nonlinear branch keeps one restore.",
+        loop_depth=0,
+        has_loop_bound=False,
     ),
 ]
 
@@ -206,18 +338,27 @@ def source_with_max_iter(source, max_iter):
 
 def stack_report_rows(max_iters):
     rows = []
+    max_iter_values = list(max_iters)
     for bench in STACK_BENCHMARKS:
-        for max_iter in max_iters:
+        for max_iter in max_iter_values:
+            if not bench.has_loop_bound and max_iter != max_iter_values[-1]:
+                continue
             code = differentiated_c_code(source_with_max_iter(bench.source, max_iter))
             after_slots = stack_slots_by_type(code)
             # "Before" models the old conservative policy: every overwritten
             # float inside the loop body is pushed once per possible iteration.
-            before_float_slots = bench.conservative_float_slots_per_iter * (max_iter ** bench.loop_depth)
+            if bench.has_loop_bound:
+                before_float_slots = bench.conservative_float_slots_per_iter * (max_iter ** bench.loop_depth)
+                bound_label = str(max_iter)
+            else:
+                before_float_slots = bench.conservative_float_slots_per_iter
+                bound_label = "n/a"
             before_bytes = total_stack_bytes(before_float_slots, after_slots["int"])
             after_bytes = total_stack_bytes(after_slots["float"], after_slots["int"])
             rows.append({
                 "benchmark": bench.name,
                 "max_iter": max_iter,
+                "bound_label": bound_label,
                 "before_float_slots": before_float_slots,
                 "after_float_slots": after_slots["float"],
                 "int_slots": after_slots["int"],
@@ -276,7 +417,7 @@ def write_result_report(output_path="result.md"):
 
     for row in rows:
         lines.append(
-            "| {benchmark} | {max_iter} | {before_float_slots} | {after_float_slots} | "
+            "| {benchmark} | {bound_label} | {before_float_slots} | {after_float_slots} | "
             "{int_slots} | {before_bytes} | {after_bytes} |".format(**row)
         )
 
@@ -291,12 +432,87 @@ def write_result_report(output_path="result.md"):
         "| linear_then_sin | `d/dx sin(n*x) = n*cos(n*x)` |",
         "| nested_linear_accumulation | `d/dx sum_i sum_j x = n*m` |",
         "| constant_scale_recurrence | affine recurrence derivative `d' = 2*d + 1` |",
+        "| nonconstant_scale_recurrence | recurrence derivative `d' = z + x*d` |",
         "| array_indexed_accumulation | `d/dx[i] sum_i x[i]*x[i] = 2*x[i]` |",
+        "| branch_linear_or_nonlinear | `1` on the linear branch, `2*x` on the nonlinear branch |",
         "",
     ]
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+
+
+class ReverseStackAliasCodegenTest(unittest.TestCase):
+    def test_constant_array_indices_are_disambiguated(self):
+        code = differentiated_c_code(ARRAY_CONSTANT_INDEX_SEPARATION)
+
+        self.assertEqual(float_stack_slots(code), 0)
+
+    def test_same_constant_array_index_still_aliases(self):
+        code = differentiated_c_code(ARRAY_SAME_CONSTANT_INDEX_ALIAS)
+
+        self.assertEqual(float_stack_slots(code), 1)
+
+    def test_dynamic_array_indices_remain_conservative(self):
+        code = differentiated_c_code(ARRAY_DYNAMIC_INDEX_MAY_ALIAS)
+
+        self.assertEqual(float_stack_slots(code), 2)
+
+
+class ReverseStackSlangGpuTest(unittest.TestCase):
+    def setUp(self):
+        os.chdir(os.path.dirname(os.path.realpath(__file__)))
+
+    def dispatch_reverse_kernel(self, source, kernel_name, x_values, dy_values, n):
+        slang_device, _, kernels = compile_slang_quiet(source)
+        x_values = np.array(x_values, dtype=np.float32)
+        dy_values = np.array(dy_values, dtype=np.float32)
+        dx_values = np.zeros_like(x_values)
+
+        buffer_x = slangpy.Tensor.from_numpy(device=slang_device, ndarray=x_values)
+        buffer_dx = slangpy.Tensor.from_numpy(device=slang_device, ndarray=dx_values)
+        buffer_dy = slangpy.Tensor.from_numpy(device=slang_device, ndarray=dy_values)
+        buffer_dn = slangpy.Tensor.from_numpy(
+            device=slang_device,
+            ndarray=np.zeros([1], dtype=np.int32),
+        )
+
+        layout = kernels[kernel_name].program.layout
+        func = layout.find_function_by_name(kernel_name)
+        kernels[kernel_name].dispatch(**{
+            "thread_count": [len(x_values), 1, 1],
+            func.parameters[1].name: len(x_values),
+            func.parameters[2].name: buffer_x.storage,
+            func.parameters[3].name: buffer_dx.storage,
+            func.parameters[4].name: n,
+            func.parameters[5].name: buffer_dn.storage,
+            func.parameters[6].name: buffer_dy.storage,
+        })
+        return buffer_dx.to_numpy()
+
+    def test_gpu_linear_accumulation_eliminates_local_float_stack(self):
+        dx = self.dispatch_reverse_kernel(
+            SIMD_LINEAR_ACCUM,
+            "rev_simd_linear_accum",
+            x_values=[0.25, 0.5, 0.75, 1.0],
+            dy_values=[1.0, 0.5, 2.0, 1.5],
+            n=6,
+        )
+        np.testing.assert_allclose(dx, np.array([6.0, 3.0, 12.0, 9.0], dtype=np.float32), rtol=1e-5)
+
+    def test_gpu_linear_then_sin_keeps_required_local_stack(self):
+        x = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+        dy = np.array([1.0, 0.5, 2.0, 1.5], dtype=np.float32)
+        n = 6
+        dx = self.dispatch_reverse_kernel(
+            SIMD_LINEAR_THEN_SIN,
+            "rev_simd_linear_then_sin",
+            x_values=x,
+            dy_values=dy,
+            n=n,
+        )
+        expected = dy * n * np.cos(n * x)
+        np.testing.assert_allclose(dx, expected, rtol=1e-5, atol=1e-5)
 
 
 class ReverseStackAnalysisTest(unittest.TestCase):
@@ -403,6 +619,26 @@ class ReverseStackAnalysisTest(unittest.TestCase):
             expected = 2.0 * expected + 1.0
         self.assertAlmostEqual(dx.value, expected, places=5)
 
+    def test_nonconstant_scale_recurrence_keeps_required_float_stack(self):
+        code = differentiated_c_code(NONCONSTANT_SCALE_RECURRENCE)
+
+        conservative_stack_slots_before_analysis = 10
+        self.assertEqual(float_stack_slots(code), conservative_stack_slots_before_analysis)
+
+        _, lib = compile_quiet(NONCONSTANT_SCALE_RECURRENCE, "_code/rev_stack_nonconstant_scale")
+        dx = ctypes.c_float(0.0)
+        dn = ctypes.c_int(0)
+        x = 0.6
+        n = 5
+        lib.rev_nonconstant_scale_recurrence(x, ctypes.byref(dx), n, ctypes.byref(dn), 1.0)
+
+        z = 1.0
+        expected = 0.0
+        for _ in range(n):
+            expected = z + x * expected
+            z = x * z + 1.0
+        self.assertAlmostEqual(dx.value, expected, places=5)
+
     def test_overwrite_after_nonlinear_use_keeps_one_restore(self):
         code = differentiated_c_code(OVERWRITE_AFTER_NONLINEAR_USE)
 
@@ -432,6 +668,38 @@ class ReverseStackAnalysisTest(unittest.TestCase):
         expected = [2.0, 4.0, 6.0, 0.0]
         for actual, expected_value in zip(dx, expected):
             self.assertAlmostEqual(actual, expected_value, places=5)
+
+    def test_constant_array_indices_do_not_alias_for_stack_liveness(self):
+        code = differentiated_c_code(ARRAY_CONSTANT_INDEX_SEPARATION)
+
+        self.assertEqual(float_stack_slots(code), 0)
+
+        _, lib = compile_quiet(
+            ARRAY_CONSTANT_INDEX_SEPARATION,
+            "_code/rev_stack_array_constant_index_separation",
+        )
+        dx = ctypes.c_float(0.0)
+        x = 0.7
+        lib.rev_array_constant_index_separation(x, ctypes.byref(dx), 1.0)
+        self.assertAlmostEqual(dx.value, math.cos(x), places=5)
+
+    def test_if_else_branch_keeps_only_nonlinear_restore(self):
+        code = differentiated_c_code(BRANCH_LINEAR_OR_NONLINEAR)
+
+        self.assertEqual(float_stack_slots(code), 1)
+
+        _, lib = compile_quiet(BRANCH_LINEAR_OR_NONLINEAR, "_code/rev_stack_branch_linear_or_nonlinear")
+
+        dx = ctypes.c_float(0.0)
+        dflag = ctypes.c_int(0)
+        x = 0.75
+        lib.rev_branch_linear_or_nonlinear(x, ctypes.byref(dx), 1, ctypes.byref(dflag), 1.0)
+        self.assertAlmostEqual(dx.value, 1.0, places=5)
+
+        dx = ctypes.c_float(0.0)
+        dflag = ctypes.c_int(0)
+        lib.rev_branch_linear_or_nonlinear(x, ctypes.byref(dx), 0, ctypes.byref(dflag), 1.0)
+        self.assertAlmostEqual(dx.value, 2.0 * x, places=5)
 
 
 if __name__ == "__main__":

@@ -67,6 +67,8 @@ class SlangCodegenVisitor(codegen_c.CCodegenVisitor):
 
         self.byref_args = set([arg.id for arg in node.args if \
             arg.i == loma_ir.Out() and (not isinstance(arg.t, loma_ir.Array))])
+        self.output_args = set([arg.id for arg in node.args if \
+            arg.i == loma_ir.Out()])
 
         self.single_ele_buffer = set([arg.id for arg in node.args if \
             arg.i == loma_ir.Out() and (not isinstance(arg.t, loma_ir.Array))])
@@ -80,6 +82,16 @@ class SlangCodegenVisitor(codegen_c.CCodegenVisitor):
         self.tab_count -= 1
         self.emit_tabs()
         self.code += '}\n'
+
+    def is_output_arg(self, node):
+        match node:
+            case loma_ir.Var():
+                return node.id in self.output_args
+            case loma_ir.ArrayAccess():
+                return self.is_output_arg(node.array)
+            case loma_ir.StructAccess():
+                return self.is_output_arg(node.struct)
+        return False
 
     def visit_expr(self, node):
         match node:
@@ -95,6 +107,8 @@ class SlangCodegenVisitor(codegen_c.CCodegenVisitor):
                     assert len(node.args) == 2
                     arg0_str = self.visit_expr(node.args[0])
                     arg1_str = self.visit_expr(node.args[1])
+                    if not self.is_output_arg(node.args[0]):
+                        return f'{arg0_str} += {arg1_str}'
                     if not self.use_cas_atomic:
                         return f'InterlockedAdd<{type_to_string(node.args[0].t)}>({arg0_str}, {arg1_str})'
                     else:
