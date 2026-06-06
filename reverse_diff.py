@@ -3,6 +3,7 @@ ir.generate_asdl_file()
 import _asdl.loma as loma_ir
 import irmutator
 import autodiff
+import os
 import string
 import random
 
@@ -435,17 +436,6 @@ def reverse_diff(diff_func_id : str,
 
     # HW2 happens here. Modify the following IR mutators to perform
     # reverse differentiation.
-    def base_var(expr):
-        match expr:
-            case loma_ir.Var():
-                return expr.id
-            case loma_ir.ArrayAccess():
-                return base_var(expr.array)
-            case loma_ir.StructAccess():
-                return base_var(expr.struct)
-            case _:
-                return None
-
     def expr_key(expr):
         """Hashable expression key for comparing array index syntax."""
         match expr:
@@ -533,6 +523,42 @@ def reverse_diff(diff_func_id : str,
     def location_set(expr):
         loc = location(expr)
         return set() if loc is None else {loc}
+
+    def conservative_cache_required(stmts, output_args):
+        """Select every non-output float write for old-policy benchmarks."""
+        cache_required = set()
+
+        def visit_stmt(stmt):
+            match stmt:
+                case loma_ir.Assign():
+                    if not isinstance(stmt.val.t, loma_ir.Int) and \
+                            not check_lhs_is_output_arg(stmt.target, output_args):
+                        cache_required.add(stmt)
+                case loma_ir.IfElse():
+                    for child_stmt in stmt.then_stmts:
+                        visit_stmt(child_stmt)
+                    for child_stmt in stmt.else_stmts:
+                        visit_stmt(child_stmt)
+                case loma_ir.While():
+                    for child_stmt in stmt.body:
+                        visit_stmt(child_stmt)
+                case loma_ir.CallStmt():
+                    if stmt.call.id != 'atomic_add':
+                        args = funcs[stmt.call.id].args
+                    else:
+                        args = [loma_ir.Arg('target', loma_ir.Float(), loma_ir.Out()),
+                                loma_ir.Arg('source', loma_ir.Float(), loma_ir.In())]
+                    for i, f_arg in enumerate(args):
+                        if f_arg.i == loma_ir.Out() and \
+                                not isinstance(f_arg.t, loma_ir.Int) and \
+                                not check_lhs_is_output_arg(stmt.call.args[i], output_args):
+                            cache_required.add((stmt, i))
+                case _:
+                    pass
+
+        for stmt in stmts:
+            visit_stmt(stmt)
+        return cache_required
 
     def vars_in_lvalue_address(expr):
         # Reads needed to locate an l-value, such as the index in a[i]. The
@@ -802,14 +828,20 @@ def reverse_diff(diff_func_id : str,
                 self.return_var_id = '_dreturn_' + random_id_generator()
                 new_args.append(loma_ir.Arg(self.return_var_id, node.ret_type, i = loma_ir.In()))
 
-            liveness = ReversePrimalLiveness(self.output_args)
-            liveness.analyze_stmt_list(node.body, set())
-            liveness.mark_stmt_list_forward(node.body, set())
-            self.cache_required = liveness.cache_required
+            stack_policy = os.environ.get('LOMA_REVERSE_STACK_POLICY', 'analysis')
+            if stack_policy == 'analysis':
+                liveness = ReversePrimalLiveness(self.output_args)
+                liveness.analyze_stmt_list(node.body, set())
+                liveness.mark_stmt_list_forward(node.body, set())
+                self.cache_required = liveness.cache_required
+            elif stack_policy == 'conservative':
+                self.cache_required = conservative_cache_required(node.body, self.output_args)
+            else:
+                raise ValueError(f'Unknown LOMA_REVERSE_STACK_POLICY: {stack_policy}')
 
             # Forward pass: emit the original primal computation and insert stack
             # saves only for writes selected by the dependency analysis above.
-            fm = ForwardPassMutator(self.output_args, liveness.cache_required)
+            fm = ForwardPassMutator(self.output_args, self.cache_required)
             forward_body = node.body
             mutated_forward = [fm.mutate_stmt(fwd_stmt) for fwd_stmt in forward_body]
             mutated_forward = irmutator.flatten(mutated_forward)

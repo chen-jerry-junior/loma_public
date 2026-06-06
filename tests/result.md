@@ -108,3 +108,8 @@ Peak bytes include both float primal stacks and unchanged integer loop-index sta
 | nonconstant_scale_recurrence | recurrence derivative `d' = z + x*d` |
 | array_indexed_accumulation | `d/dx[i] sum_i x[i]*x[i] = 2*x[i]` |
 | branch_linear_or_nonlinear | `1` on the linear branch, `2*x` on the nonlinear branch |
+
+## Optional Slang GPU Benchmark
+
+Run `LOMA_RUN_GPU_BENCHMARKS=1 python -m unittest tests/test_reverse_stack_analysis.py` to time the optimized Slang reverse kernels against the conservative stack policy.
+The benchmark writes `gpu_result.md` and is skipped by default because GPU timing depends on local hardware and driver state.

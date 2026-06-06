@@ -5,6 +5,7 @@ import math
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 import unittest
 
@@ -15,6 +16,7 @@ sys.path.append(parent)
 import autodiff
 import check
 import codegen_c
+import codegen_slang
 import compiler
 import parser
 import slang_utils
@@ -222,8 +224,38 @@ def differentiated_c_code(source):
         return codegen_c.codegen_c(structs, funcs)
 
 
+STACK_POLICY_ENV = "LOMA_REVERSE_STACK_POLICY"
+
+
+@contextlib.contextmanager
+def reverse_stack_policy(policy):
+    old_policy = os.environ.get(STACK_POLICY_ENV)
+    os.environ[STACK_POLICY_ENV] = policy
+    try:
+        yield
+    finally:
+        if old_policy is None:
+            os.environ.pop(STACK_POLICY_ENV, None)
+        else:
+            os.environ[STACK_POLICY_ENV] = old_policy
+
+
+def differentiated_slang_code(source, policy="analysis"):
+    with reverse_stack_policy(policy), contextlib.redirect_stdout(io.StringIO()):
+        structs, funcs = parser.parse(source)
+        structs, diff_structs, funcs = autodiff.resolve_diff_types(structs, funcs)
+        check.check_ir(structs, diff_structs, funcs, check_diff=False)
+        funcs = autodiff.differentiate(structs, diff_structs, funcs)
+        check.check_ir(structs, diff_structs, funcs, check_diff=True)
+        return codegen_slang.codegen_slang(structs, funcs, use_cas_atomic=False)
+
+
 def float_stack_slots(c_code):
     return sum(int(size) for size in re.findall(r"float _t_float_[A-Za-z0-9]+\[(\d+)\];", c_code))
+
+
+def slang_float_stack_slots(slang_code):
+    return sum(int(size) for size in re.findall(r"\bfloat _t_float_[A-Za-z0-9]+\[(\d+)\];", slang_code))
 
 
 def stack_slots_by_type(c_code):
@@ -244,15 +276,43 @@ def compile_quiet(source, output_filename):
         return compiler.compile(source, target="c", output_filename=output_filename)
 
 
-def compile_slang_quiet(source):
-    slang_device = slang_utils.create_slang_device()
-    with contextlib.redirect_stdout(io.StringIO()):
+def compile_slang_quiet(source, policy="analysis"):
+    try:
+        slang_device = slang_utils.create_slang_device()
+    except RuntimeError as exc:
+        raise unittest.SkipTest(f"Slang/Metal device unavailable: {exc}") from exc
+    with reverse_stack_policy(policy), contextlib.redirect_stdout(io.StringIO()):
         module, kernels = compiler.compile(
             source,
             target="slang",
             slang_device=slang_device,
         )
     return slang_device, module, kernels
+
+
+def write_gpu_result_report(rows, output_path="gpu_result.md"):
+    lines = [
+        "# Slang GPU Reverse-Stack Benchmark",
+        "",
+        "These timings compare the same source program under two reverse-stack policies:",
+        "`analysis` is the optimized dependency-aware policy, and `conservative` caches every non-output float write.",
+        "Runtime is reported as average Python-dispatch wall time per kernel launch, so use it as a local trend check rather than a hardware-independent number.",
+        "",
+        "| Benchmark | Threads | n | Optimized float slots | Conservative float slots | Optimized ms | Conservative ms | Speedup |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        speedup = row["conservative_ms"] / row["optimized_ms"] if row["optimized_ms"] > 0 else 0.0
+        lines.append(
+            "| {benchmark} | {threads} | {n} | {optimized_slots} | {conservative_slots} | "
+            "{optimized_ms:.4f} | {conservative_ms:.4f} | {speedup:.2f}x |".format(
+                **row,
+                speedup=speedup,
+            )
+        )
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 @dataclass(frozen=True)
@@ -436,6 +496,11 @@ def write_result_report(output_path="result.md"):
         "| array_indexed_accumulation | `d/dx[i] sum_i x[i]*x[i] = 2*x[i]` |",
         "| branch_linear_or_nonlinear | `1` on the linear branch, `2*x` on the nonlinear branch |",
         "",
+        "## Optional Slang GPU Benchmark",
+        "",
+        "Run `LOMA_RUN_GPU_BENCHMARKS=1 python -m unittest tests/test_reverse_stack_analysis.py` to time the optimized Slang reverse kernels against the conservative stack policy.",
+        "The benchmark writes `gpu_result.md` and is skipped by default because GPU timing depends on local hardware and driver state.",
+        "",
     ]
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -458,13 +523,27 @@ class ReverseStackAliasCodegenTest(unittest.TestCase):
 
         self.assertEqual(float_stack_slots(code), 2)
 
+    def test_slang_linear_accumulation_omits_local_float_stack(self):
+        optimized_code = differentiated_slang_code(SIMD_LINEAR_ACCUM)
+        conservative_code = differentiated_slang_code(SIMD_LINEAR_ACCUM, policy="conservative")
+
+        self.assertEqual(slang_float_stack_slots(optimized_code), 0)
+        self.assertGreater(slang_float_stack_slots(conservative_code), 0)
+
+    def test_slang_linear_then_sin_keeps_required_local_float_stack(self):
+        optimized_code = differentiated_slang_code(SIMD_LINEAR_THEN_SIN)
+        conservative_code = differentiated_slang_code(SIMD_LINEAR_THEN_SIN, policy="conservative")
+
+        self.assertEqual(slang_float_stack_slots(optimized_code), 10)
+        self.assertEqual(slang_float_stack_slots(conservative_code), 30)
+
 
 class ReverseStackSlangGpuTest(unittest.TestCase):
     def setUp(self):
         os.chdir(os.path.dirname(os.path.realpath(__file__)))
 
-    def dispatch_reverse_kernel(self, source, kernel_name, x_values, dy_values, n):
-        slang_device, _, kernels = compile_slang_quiet(source)
+    def prepare_reverse_kernel(self, source, kernel_name, x_values, dy_values, n, policy="analysis"):
+        slang_device, _, kernels = compile_slang_quiet(source, policy=policy)
         x_values = np.array(x_values, dtype=np.float32)
         dy_values = np.array(dy_values, dtype=np.float32)
         dx_values = np.zeros_like(x_values)
@@ -479,7 +558,7 @@ class ReverseStackSlangGpuTest(unittest.TestCase):
 
         layout = kernels[kernel_name].program.layout
         func = layout.find_function_by_name(kernel_name)
-        kernels[kernel_name].dispatch(**{
+        dispatch_args = {
             "thread_count": [len(x_values), 1, 1],
             func.parameters[1].name: len(x_values),
             func.parameters[2].name: buffer_x.storage,
@@ -487,8 +566,37 @@ class ReverseStackSlangGpuTest(unittest.TestCase):
             func.parameters[4].name: n,
             func.parameters[5].name: buffer_dn.storage,
             func.parameters[6].name: buffer_dy.storage,
-        })
+        }
+        return kernels[kernel_name], dispatch_args, buffer_dx
+
+    def dispatch_reverse_kernel(self, source, kernel_name, x_values, dy_values, n, policy="analysis"):
+        kernel, dispatch_args, buffer_dx = self.prepare_reverse_kernel(
+            source,
+            kernel_name,
+            x_values,
+            dy_values,
+            n,
+            policy=policy,
+        )
+        kernel.dispatch(**dispatch_args)
         return buffer_dx.to_numpy()
+
+    def time_reverse_kernel(self, source, kernel_name, x_values, dy_values, n, policy, repeats):
+        kernel, dispatch_args, buffer_dx = self.prepare_reverse_kernel(
+            source,
+            kernel_name,
+            x_values,
+            dy_values,
+            n,
+            policy=policy,
+        )
+        for _ in range(3):
+            kernel.dispatch(**dispatch_args)
+        start = time.perf_counter()
+        for _ in range(repeats):
+            kernel.dispatch(**dispatch_args)
+        buffer_dx.to_numpy()
+        return (time.perf_counter() - start) * 1000.0 / repeats
 
     def test_gpu_linear_accumulation_eliminates_local_float_stack(self):
         dx = self.dispatch_reverse_kernel(
@@ -513,6 +621,60 @@ class ReverseStackSlangGpuTest(unittest.TestCase):
         )
         expected = dy * n * np.cos(n * x)
         np.testing.assert_allclose(dx, expected, rtol=1e-5, atol=1e-5)
+
+    @unittest.skipUnless(
+        os.environ.get("LOMA_RUN_GPU_BENCHMARKS") == "1",
+        "set LOMA_RUN_GPU_BENCHMARKS=1 to run local Slang timing benchmarks",
+    )
+    def test_gpu_reverse_stack_policy_benchmark(self):
+        threads = int(os.environ.get("LOMA_GPU_BENCH_THREADS", "4096"))
+        repeats = int(os.environ.get("LOMA_GPU_BENCH_REPEATS", "30"))
+        x_values = np.linspace(0.05, 0.95, threads, dtype=np.float32)
+        dy_values = np.ones(threads, dtype=np.float32)
+        benchmarks = [
+            ("simd_linear_accum", SIMD_LINEAR_ACCUM, "rev_simd_linear_accum", 10),
+            ("simd_linear_then_sin", SIMD_LINEAR_THEN_SIN, "rev_simd_linear_then_sin", 10),
+        ]
+        rows = []
+
+        for name, source, kernel_name, n in benchmarks:
+            optimized_code = differentiated_slang_code(source)
+            conservative_code = differentiated_slang_code(source, policy="conservative")
+            optimized_slots = slang_float_stack_slots(optimized_code)
+            conservative_slots = slang_float_stack_slots(conservative_code)
+            self.assertLess(optimized_slots, conservative_slots)
+
+            optimized_ms = self.time_reverse_kernel(
+                source,
+                kernel_name,
+                x_values,
+                dy_values,
+                n,
+                policy="analysis",
+                repeats=repeats,
+            )
+            conservative_ms = self.time_reverse_kernel(
+                source,
+                kernel_name,
+                x_values,
+                dy_values,
+                n,
+                policy="conservative",
+                repeats=repeats,
+            )
+            self.assertGreater(optimized_ms, 0.0)
+            self.assertGreater(conservative_ms, 0.0)
+            rows.append({
+                "benchmark": name,
+                "threads": threads,
+                "n": n,
+                "optimized_slots": optimized_slots,
+                "conservative_slots": conservative_slots,
+                "optimized_ms": optimized_ms,
+                "conservative_ms": conservative_ms,
+            })
+
+        write_gpu_result_report(rows)
 
 
 class ReverseStackAnalysisTest(unittest.TestCase):
