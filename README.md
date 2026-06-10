@@ -70,23 +70,23 @@ These results show that the optimization consistently reduces local reverse-mode
 
 ### Running the tests
 
-Use the workspace virtual environment:
+Run the reverse-stack regression suite:
 
 ```bash
-.venv/bin/python -m unittest tests/test_reverse_stack_analysis.py
+python -m unittest tests/test_reverse_stack_analysis.py
 ```
 
 Run the HW3 regression suite:
 
 ```bash
-.venv/bin/python hw_tests/hw3/test.py
+python hw_tests/hw3/test.py
 ```
 
 Run the optional Slang GPU benchmark:
 
 ```bash
 LOMA_RUN_GPU_BENCHMARKS=1 LOMA_GPU_BENCH_THREADS=65536 LOMA_GPU_BENCH_REPEATS=50 \
-  .venv/bin/python -m unittest tests.test_reverse_stack_analysis.ReverseStackSlangGpuTest.test_gpu_reverse_stack_policy_benchmark
+  python -m unittest tests.test_reverse_stack_analysis.ReverseStackSlangGpuTest.test_gpu_reverse_stack_policy_benchmark
 ```
 
 The GPU benchmark writes:
